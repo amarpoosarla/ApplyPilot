@@ -1,16 +1,29 @@
 """
 Unified LLM client for ApplyPilot.
 
-Auto-detects provider from environment:
-  GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
+Auto-detects providers from environment:
+  GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)  [scoring / fast tasks]
+  NVIDIA_API_KEY  -> NVIDIA NIM / Llama   (default: meta/llama-3.3-70b-instruct) [writing tasks]
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
 
-LLM_MODEL env var overrides the model name for any provider.
+Task routing via get_client(role):
+  "scoring"  -> fast/cheap model (Gemini Flash) for scoring, enrichment, extraction, judge
+  "writing"  -> quality model (Llama 70B via NVIDIA NIM) for tailoring and cover letters
+  default    -> same as "scoring"
+
+If only one provider is configured, both roles use it.
+The writing client automatically falls back to the scoring client on rate limits.
+
+Model overrides:
+  SCORING_MODEL  -> override model for scoring tasks
+  WRITING_MODEL  -> override model for writing tasks
+  LLM_MODEL      -> override model for any single-provider setup
 """
 
 import logging
 import os
+import threading
 import time
 
 import httpx
@@ -21,22 +34,28 @@ log = logging.getLogger(__name__)
 # Provider detection
 # ---------------------------------------------------------------------------
 
-def _detect_provider() -> tuple[str, str, str]:
-    """Return (base_url, model, api_key) based on environment variables.
+_NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
+_GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
+_GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-    Reads env at call time (not module import time) so that load_env() called
-    in _bootstrap() is always visible here.
+
+def _detect_scoring_provider() -> tuple[str, str, str]:
+    """Return (base_url, model, api_key) for the fast/scoring provider.
+
+    Priority: NVIDIA NIM > OpenAI > local > Gemini (last resort).
+    NVIDIA is preferred because it has higher parallel request limits.
     """
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    nvidia_key = os.environ.get("NVIDIA_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
-    model_override = os.environ.get("LLM_MODEL", "")
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    model_override = os.environ.get("SCORING_MODEL") or os.environ.get("LLM_MODEL", "")
 
-    if gemini_key and not local_url:
+    if nvidia_key and not local_url:
         return (
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            model_override or "gemini-2.0-flash",
-            gemini_key,
+            _NVIDIA_BASE,
+            model_override or "meta/llama-3.1-8b-instruct",
+            nvidia_key,
         )
 
     if openai_key and not local_url:
@@ -53,9 +72,61 @@ def _detect_provider() -> tuple[str, str, str]:
             os.environ.get("LLM_API_KEY", ""),
         )
 
+    if gemini_key:
+        return (
+            _GEMINI_COMPAT_BASE,
+            model_override or "gemini-2.0-flash",
+            gemini_key,
+        )
+
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+        "Set NVIDIA_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+    )
+
+
+def _detect_writing_provider() -> tuple[str, str, str]:
+    """Return (base_url, model, api_key) for the quality/writing provider.
+
+    Priority: NVIDIA NIM > OpenAI > local > Gemini (last resort).
+    """
+    nvidia_key = os.environ.get("NVIDIA_API_KEY", "")
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    local_url = os.environ.get("LLM_URL", "")
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    model_override = os.environ.get("WRITING_MODEL") or os.environ.get("LLM_MODEL", "")
+
+    if nvidia_key and not local_url:
+        return (
+            _NVIDIA_BASE,
+            model_override or "meta/llama-3.3-70b-instruct",
+            nvidia_key,
+        )
+
+    if openai_key and not local_url:
+        return (
+            "https://api.openai.com/v1",
+            model_override or "gpt-4o-mini",
+            openai_key,
+        )
+
+    if local_url:
+        return (
+            local_url.rstrip("/"),
+            model_override or "local-model",
+            os.environ.get("LLM_API_KEY", ""),
+        )
+
+    if gemini_key:
+        return (
+            _GEMINI_COMPAT_BASE,
+            model_override or "gemini-2.0-flash",
+            gemini_key,
+        )
+
+    raise RuntimeError(
+        "No LLM provider configured. "
+        "Set NVIDIA_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
     )
 
 
@@ -67,12 +138,32 @@ _MAX_RETRIES = 5
 _TIMEOUT = 120  # seconds
 
 # Base wait on first 429/503 (doubles each retry, caps at 60s).
-# Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
 _RATE_LIMIT_BASE_WAIT = 10
 
+# ---------------------------------------------------------------------------
+# Global rate limiter for Gemini (15 RPM free tier)
+# Serializes ALL Gemini calls across parallel workers so we never exceed the limit.
+# ---------------------------------------------------------------------------
 
-_GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
-_GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
+class _RateLimiter:
+    """Thread-safe token bucket that enforces a minimum interval between calls."""
+
+    def __init__(self, calls_per_minute: int) -> None:
+        self._interval = 60.0 / calls_per_minute
+        self._lock = threading.Lock()
+        self._last_call: float = 0.0
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            wait = self._interval - (now - self._last_call)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call = time.monotonic()
+
+
+# One shared limiter for all Gemini clients (14 RPM = safe headroom under 15)
+_gemini_rate_limiter = _RateLimiter(calls_per_minute=14)
 
 
 class LLMClient:
@@ -101,14 +192,7 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
     ) -> str:
-        """Call the native Gemini generateContent API.
-
-        Used automatically when the OpenAI-compat endpoint returns 403,
-        which happens for preview/experimental models not exposed via compat.
-
-        Converts OpenAI-style messages to Gemini's contents/systemInstruction
-        format transparently.
-        """
+        """Call the native Gemini generateContent API."""
         contents: list[dict] = []
         system_parts: list[dict] = []
 
@@ -120,7 +204,6 @@ class LLMClient:
             elif role == "user":
                 contents.append({"role": "user", "parts": [{"text": text}]})
             elif role == "assistant":
-                # Gemini uses "model" instead of "assistant"
                 contents.append({"role": "model", "parts": [{"text": text}]})
 
         payload: dict = {
@@ -133,6 +216,7 @@ class LLMClient:
         if system_parts:
             payload["systemInstruction"] = {"parts": system_parts}
 
+        _gemini_rate_limiter.acquire()
         url = f"{_GEMINI_NATIVE_BASE}/models/{self.model}:generateContent"
         resp = self._client.post(
             url,
@@ -164,6 +248,9 @@ class LLMClient:
             "max_tokens": max_tokens,
         }
 
+        if self._is_gemini:
+            _gemini_rate_limiter.acquire()
+
         resp = self._client.post(
             f"{self.base_url}/chat/completions",
             json=payload,
@@ -171,7 +258,6 @@ class LLMClient:
         )
 
         # 403 on Gemini compat = model not available on compat layer.
-        # Raise a specific sentinel so chat() can switch to native API.
         if resp.status_code == 403 and self._is_gemini:
             raise _GeminiCompatForbidden(resp)
 
@@ -193,7 +279,6 @@ class LLMClient:
     ) -> str:
         """Send a chat completion request and return the assistant message text."""
         # Qwen3 optimization: prepend /no_think to skip chain-of-thought
-        # reasoning, saving tokens on structured extraction tasks.
         if "qwen" in self.model.lower() and messages:
             first = messages[0]
             if first.get("role") == "user" and not first["content"].startswith("/no_think"):
@@ -201,22 +286,18 @@ class LLMClient:
 
         for attempt in range(_MAX_RETRIES):
             try:
-                # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
 
                 return self._chat_compat(messages, temperature, max_tokens)
 
-            except _GeminiCompatForbidden as exc:
-                # Model not available on OpenAI-compat layer — switch to native.
+            except _GeminiCompatForbidden:
                 log.warning(
                     "Gemini compat endpoint returned 403 for model '%s'. "
-                    "Switching to native generateContent API. "
-                    "(Preview/experimental models are often compat-only on native.)",
+                    "Switching to native generateContent API.",
                     self.model,
                 )
                 self._use_native_gemini = True
-                # Retry immediately with native — don't count as a rate-limit wait
                 try:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
                 except httpx.HTTPStatusError as native_exc:
@@ -229,7 +310,6 @@ class LLMClient:
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
                 if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
-                    # Respect Retry-After header if provided (Gemini sends this).
                     retry_after = (
                         resp.headers.get("Retry-After")
                         or resp.headers.get("X-RateLimit-Reset-Requests")
@@ -243,10 +323,8 @@ class LLMClient:
                         wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
 
                     log.warning(
-                        "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
-                        "Tip: Gemini free tier = 15 RPM. Consider a paid account "
-                        "or switching to a local model.",
-                        resp.status_code, wait, attempt + 1, _MAX_RETRIES,
+                        "LLM rate limited (HTTP %s) on %s. Waiting %ds before retry %d/%d.",
+                        resp.status_code, self.model, wait, attempt + 1, _MAX_RETRIES,
                     )
                     time.sleep(wait)
                     continue
@@ -256,8 +334,8 @@ class LLMClient:
                 if attempt < _MAX_RETRIES - 1:
                     wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
                     log.warning(
-                        "LLM request timed out, retrying in %ds (attempt %d/%d)",
-                        wait, attempt + 1, _MAX_RETRIES,
+                        "LLM request timed out on %s, retrying in %ds (attempt %d/%d)",
+                        self.model, wait, attempt + 1, _MAX_RETRIES,
                     )
                     time.sleep(wait)
                     continue
@@ -273,6 +351,46 @@ class LLMClient:
         self._client.close()
 
 
+class _FallbackLLMClient:
+    """Wraps a primary LLMClient with a fallback for rate-limit exhaustion.
+
+    When the primary client raises after all its internal retries (typically
+    a final 429/503), this wrapper transparently retries with the fallback
+    client instead of propagating the error.
+    """
+
+    def __init__(self, primary: LLMClient, fallback: LLMClient) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.model = primary.model  # expose for logging
+
+    def chat(self, messages: list[dict], **kwargs) -> str:
+        try:
+            return self.primary.chat(messages, **kwargs)
+        except (httpx.HTTPStatusError, RuntimeError) as exc:
+            # Fall back on rate-limit / server errors or exhausted retries.
+            is_rate_limit = (
+                isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code in (429, 503)
+            ) or (
+                isinstance(exc, RuntimeError)
+                and "after all retries" in str(exc)
+            )
+            if is_rate_limit:
+                log.warning(
+                    "Primary LLM (%s) rate limited — switching to fallback (%s) immediately.",
+                    self.primary.model, self.fallback.model,
+                )
+                return self.fallback.chat(messages, **kwargs)
+            raise
+
+    def ask(self, prompt: str, **kwargs) -> str:
+        return self.chat([{"role": "user", "content": prompt}], **kwargs)
+
+    def close(self) -> None:
+        self.primary.close()
+
+
 class _GeminiCompatForbidden(Exception):
     """Sentinel: Gemini OpenAI-compat returned 403. Switch to native API."""
     def __init__(self, response: httpx.Response) -> None:
@@ -281,17 +399,67 @@ class _GeminiCompatForbidden(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Singleton
+# Singletons
 # ---------------------------------------------------------------------------
 
-_instance: LLMClient | None = None
+_scoring_instance: LLMClient | None = None
+_writing_instance: LLMClient | _FallbackLLMClient | None = None
 
 
-def get_client() -> LLMClient:
-    """Return (or create) the module-level LLMClient singleton."""
-    global _instance
-    if _instance is None:
-        base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
-        _instance = LLMClient(base_url, model, api_key)
-    return _instance
+def get_client(role: str = "scoring") -> LLMClient | _FallbackLLMClient:
+    """Return the LLM client for the given role.
+
+    Args:
+        role: "scoring" (fast, many calls) or "writing" (quality, fewer calls).
+              Any other value defaults to "scoring".
+
+    Routing:
+        - "scoring"  → Gemini Flash (or single configured provider)
+        - "writing"  → NVIDIA NIM / Llama 70B, falling back to scoring client
+                       on rate-limit exhaustion
+
+    Both singletons are created lazily on first use.
+    """
+    global _scoring_instance, _writing_instance
+
+    if role == "writing":
+        if _writing_instance is None:
+            _writing_instance = _build_writing_client()
+        return _writing_instance
+
+    # scoring / default
+    if _scoring_instance is None:
+        _scoring_instance = _build_scoring_client()
+    return _scoring_instance
+
+
+def _build_scoring_client() -> LLMClient | _FallbackLLMClient:
+    """NVIDIA primary (high rate limits) → Gemini fallback."""
+    w_url, w_model, w_key = _detect_writing_provider()
+    s_url, s_model, s_key = _detect_scoring_provider()
+
+    primary = LLMClient(w_url, w_model, w_key)
+    log.info("Scoring LLM (primary): %s  model: %s", w_url, w_model)
+
+    if w_url != s_url or w_model != s_model:
+        fallback = LLMClient(s_url, s_model, s_key)
+        log.info("Scoring LLM (fallback): %s  model: %s", s_url, s_model)
+        return _FallbackLLMClient(primary=primary, fallback=fallback)
+
+    return primary
+
+
+def _build_writing_client() -> LLMClient | _FallbackLLMClient:
+    """NVIDIA primary → Gemini fallback."""
+    w_url, w_model, w_key = _detect_writing_provider()
+    s_url, s_model, s_key = _detect_scoring_provider()
+
+    primary = LLMClient(w_url, w_model, w_key)
+    log.info("Writing LLM (primary): %s  model: %s", w_url, w_model)
+
+    if w_url != s_url or w_model != s_model:
+        fallback = LLMClient(s_url, s_model, s_key)
+        log.info("Writing LLM (fallback): %s  model: %s", s_url, s_model)
+        return _FallbackLLMClient(primary=primary, fallback=fallback)
+
+    return primary

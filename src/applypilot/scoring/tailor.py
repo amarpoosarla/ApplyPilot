@@ -325,7 +325,7 @@ def judge_tailored_resume(
         )},
     ]
 
-    client = get_client()
+    client = get_client("scoring")
     response = client.chat(messages, max_tokens=512, temperature=0.1)
 
     passed = "VERDICT: PASS" in response.upper()
@@ -382,11 +382,15 @@ def tailor_resume(
     }
     avoid_notes: list[str] = []
     tailored = ""
-    client = get_client()
+    client = get_client("writing")
     tailor_prompt_base = _build_tailor_prompt(profile)
 
     for attempt in range(max_retries + 1):
         report["attempts"] = attempt + 1
+
+        # Back off between retries to avoid hammering the LLM
+        if attempt > 0:
+            time.sleep(5 * attempt)
 
         # Fresh conversation every attempt
         prompt = tailor_prompt_base

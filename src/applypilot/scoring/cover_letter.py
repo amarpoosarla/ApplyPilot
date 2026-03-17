@@ -145,10 +145,14 @@ def generate_cover_letter(
 
     avoid_notes: list[str] = []
     letter = ""
-    client = get_client()
+    client = get_client("writing")
     cl_prompt_base = _build_cover_letter_prompt(profile)
 
     for attempt in range(max_retries + 1):
+        # Back off between retries
+        if attempt > 0:
+            time.sleep(5 * attempt)
+
         # Fresh conversation every attempt
         prompt = cl_prompt_base
         if avoid_notes:

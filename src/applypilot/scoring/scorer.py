@@ -92,13 +92,23 @@ def score_job(resume_text: str, job: dict) -> dict:
         {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
     ]
 
-    try:
-        client = get_client()
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
-        return _parse_score_response(response)
-    except Exception as e:
-        log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
-        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
+    last_err = None
+    for attempt in range(3):
+        try:
+            client = get_client("scoring")
+            response = client.chat(messages, max_tokens=512, temperature=0.2)
+            result = _parse_score_response(response)
+            if result["score"] > 0:
+                return result
+            last_err = "parse failed (got score=0)"
+        except Exception as e:
+            last_err = str(e)
+            log.warning("LLM error scoring '%s' (attempt %d/3): %s",
+                        job.get("title", "?"), attempt + 1, e)
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+    log.error("Scoring failed after 3 attempts for '%s': %s", job.get("title", "?"), last_err)
+    return {"score": 0, "keywords": "", "reasoning": f"LLM error: {last_err}"}
 
 
 def run_scoring(limit: int = 0, rescore: bool = False) -> dict:

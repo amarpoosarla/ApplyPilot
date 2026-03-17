@@ -11,11 +11,34 @@ from rich.table import Table
 
 from applypilot import __version__
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%H:%M:%S",
-)
+def _setup_logging() -> None:
+    """Configure logging: INFO to console + rotating file in ~/.applypilot/logs/."""
+    import os
+    from logging.handlers import RotatingFileHandler
+    from datetime import date
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+                            datefmt="%H:%M:%S")
+
+    # Console handler (existing behaviour)
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    root.addHandler(ch)
+
+    # File handler — one file per day, max 20 MB, keep 14 days
+    log_dir = os.path.expanduser("~/.applypilot/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"applypilot_{date.today().strftime('%Y%m%d')}.log")
+    fh = RotatingFileHandler(log_file, maxBytes=20 * 1024 * 1024, backupCount=14,
+                             encoding="utf-8")
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+
+
+_setup_logging()
 
 app = typer.Typer(
     name="applypilot",
